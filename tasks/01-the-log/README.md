@@ -9,8 +9,11 @@
 **Story 1: the silent skip.** A reconciliation consumer was switched off over
 a long holiday: 9 days. Topic retention was the default 7 days. When it came
 back, its committed offset pointed at data that had already been deleted, so
-the client fell back to `auto.offset.reset=latest`. Two days of payments were
-skipped without a single error log. Finance found it a month later. In Pulsar
+the client fell back to `auto.offset.reset=latest` and jumped to the end of
+the log. Retention had already deleted the oldest 2 days, and `latest` skipped
+the 7 days that were still on the brokers: 9 days of payments went unchecked
+without a single error log. With `earliest` only the deleted 2 days would have
+been lost. Finance found it a month later. In Pulsar
 the unacked backlog would still have been there. **Kafka retention ignores
 consumers completely.**
 
