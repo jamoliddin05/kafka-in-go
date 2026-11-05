@@ -1,0 +1,32 @@
+#:schema https://json.schemastore.org/any.json
+# Used only by the dev container (see Dockerfile `dev` stage).
+# The Dockerfile CMD narrows watching to internal/ + tasks/$TASK, so editing
+# another task doesn't restart (and rebalance) the processes you're running.
+root = "."
+tmp_dir = "tmp"
+# Compose already injects env; don't let air re-read .env and override TASK/ROLE.
+env_files = []
+
+[build]
+  # Binary goes outside the bind mount so scaled replicas don't overwrite each other.
+  cmd = "go build -o /tmp/bin/app ./tasks/$TASK"
+  entrypoint = ["/tmp/bin/app"]
+  include_ext = ["go"]
+  exclude_dir = ["tmp", ".git", ".idea"]
+  exclude_regex = ["_test\\.go"]
+  delay = 300
+  stop_on_error = true
+  # SIGINT first, so a reload is a graceful shutdown: commit offsets, leave the group.
+  send_interrupt = true
+  kill_delay = "20s"
+  rerun = false
+
+[log]
+  time = false
+  main_only = true
+
+[misc]
+  clean_on_exit = false
+
+[screen]
+  clear_on_rebuild = false

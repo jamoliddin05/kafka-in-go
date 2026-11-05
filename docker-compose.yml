@@ -1,0 +1,207 @@
+name: kafka-course
+
+# Three KRaft nodes (each one is both broker and controller), so RF=3 and
+# min.insync.replicas=2 behave like a real prod cluster when you stop brokers.
+x-kafka: &kafka
+  image: apache/kafka:4.3.1
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:29092 >/dev/null 2>&1"]
+    interval: 5s
+    timeout: 10s
+    retries: 30
+    start_period: 20s
+
+x-kafka-env: &kafka-env
+  CLUSTER_ID: kafka-course-cluster-0001
+  KAFKA_PROCESS_ROLES: broker,controller
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:29093,2@kafka-2:29093,3@kafka-3:29093
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+  KAFKA_MIN_INSYNC_REPLICAS: 2
+  KAFKA_NUM_PARTITIONS: 3
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+  # Prod clusters disable this: a typo in a topic name must fail, not create a new topic.
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+  # Prod default is 3s; zero makes rebalances visible immediately while you experiment.
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+  # Prod default is 5min; 10s lets you watch retention delete segments in task 01.
+  KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 10000
+  KAFKA_LOG_DIRS: /var/lib/kafka/data
+  KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+
+# Dev container for the Go code: source is bind-mounted and air rebuilds on save.
+# TASK picks the directory under tasks/, ROLE picks the process inside that task.
+x-go-dev: &go-dev
+  build:
+    context: .
+    target: dev
+  image: kafka-course/dev:latest
+  profiles: [app]
+  # Per-task knobs (ACKS=..., FROM=...). Edit the file and re-run `make dev`:
+  # compose recreates the containers when their env changes.
+  env_file: &task-env
+    - path: ./tasks/${TASK:-01-the-log}/../task.env
+      required: false
+    - path: ./tasks/${TASK:-01-the-log}/task.env
+      required: false
+  volumes:
+    - .:/src
+    - gomod:/go/pkg/mod
+    - gocache:/root/.cache/go-build
+  depends_on:
+    kafka-1: { condition: service_healthy }
+    kafka-2: { condition: service_healthy }
+    kafka-3: { condition: service_healthy }
+  stop_grace_period: 30s
+
+x-go-env: &go-env
+  TASK: ${TASK:-01-the-log}
+  # Knobs such as VERSION, LOG_LEVEL and KAFKA_LOG_LEVEL belong in task.env:
+  # anything listed here would override it.
+  KAFKA_BROKERS: kafka-1:29092,kafka-2:29092,kafka-3:29092
+  DATABASE_URL: postgres://course:course@postgres:5432/course?sslmode=disable
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+
+services:
+  kafka-1:
+    <<: *kafka
+    hostname: kafka-1
+    ports: ["9092:9092"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENERS: INTERNAL://:29092,CONTROLLER://:29093,EXTERNAL://:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-1:29092,EXTERNAL://localhost:9092
+
+  kafka-2:
+    <<: *kafka
+    hostname: kafka-2
+    ports: ["9093:9093"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_LISTENERS: INTERNAL://:29092,CONTROLLER://:29093,EXTERNAL://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-2:29092,EXTERNAL://localhost:9093
+
+  kafka-3:
+    <<: *kafka
+    hostname: kafka-3
+    ports: ["9094:9094"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_LISTENERS: INTERNAL://:29092,CONTROLLER://:29093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-3:29092,EXTERNAL://localhost:9094
+
+  kafka-ui:
+    image: kafbat/kafka-ui:v1.5.0
+    ports: ["8085:8080"]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka-1:29092,kafka-2:29092,kafka-3:29092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    depends_on:
+      kafka-1: { condition: service_healthy }
+
+  jaeger:
+    image: jaegertracing/jaeger:2.21.0
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+
+  postgres:
+    image: postgres:18.6-alpine
+    ports: ["5433:5432"]
+    environment:
+      POSTGRES_USER: course
+      POSTGRES_PASSWORD: course
+      POSTGRES_DB: course
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U course -d course"]
+      interval: 3s
+      retries: 20
+
+  # Generic process slots. Each task's README says which ones it uses, e.g.
+  #   make dev T=05-consumer-groups R="producer consumer"
+  api:
+    <<: *go-dev
+    ports: ["8080:8080"]
+    environment:
+      <<: *go-env
+      ROLE: api
+      HTTP_ADDR: ":8080"
+
+  producer:
+    <<: *go-dev
+    environment:
+      <<: *go-env
+      ROLE: producer
+
+  processor:
+    <<: *go-dev
+    environment:
+      <<: *go-env
+      ROLE: processor
+
+  relay:
+    <<: *go-dev
+    environment:
+      <<: *go-env
+      ROLE: relay
+
+  consumer:
+    <<: *go-dev
+    environment:
+      <<: *go-env
+      ROLE: consumer
+
+  # Prod-image replicas for the deploy experiments (task 07, 14). Built from the
+  # `prod` stage: a static binary on distroless, no Go toolchain and no air.
+  # Three named services instead of `replicas: 3` so a script can roll them one by one.
+  worker-a: &worker
+    build:
+      context: .
+      target: prod
+      args:
+        TASK: ${TASK:-07-graceful-shutdown}
+    image: kafka-course/${TASK:-07-graceful-shutdown}:${VERSION:-v1}
+    profiles: [prod]
+    env_file: *task-env
+    hostname: worker-a
+    stop_grace_period: ${STOP_GRACE:-30s}
+    environment: &worker-env
+      TASK: ${TASK:-07-graceful-shutdown}
+      VERSION: ${VERSION:-v1}
+      ROLE: ${WORKER_ROLE:-consumer}
+      INSTANCE: worker-a
+      LOG_FORMAT: json
+      KAFKA_BROKERS: kafka-1:29092,kafka-2:29092,kafka-3:29092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+    depends_on:
+      kafka-1: { condition: service_healthy }
+      kafka-2: { condition: service_healthy }
+      kafka-3: { condition: service_healthy }
+
+  worker-b:
+    <<: *worker
+    hostname: worker-b
+    environment:
+      <<: *worker-env
+      INSTANCE: worker-b
+
+  worker-c:
+    <<: *worker
+    hostname: worker-c
+    environment:
+      <<: *worker-env
+      INSTANCE: worker-c
+
+volumes:
+  gomod:
+  gocache:
